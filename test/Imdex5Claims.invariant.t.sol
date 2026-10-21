@@ -8,9 +8,9 @@ import {Imdex5Base} from "./Imdex5Base.sol";
 import {MockERC20, MockPoolManager} from "./mocks/Mocks.sol";
 
 /// Independent ledger for claims, including IMD, across empty and refilled epochs.
-/// Failure modes here return false BEFORE moving funds, revert, or exhaust their
-/// stipend. A transfer that mutates balances then returns false is a separately
-/// reported defect; its failing proof must not be converted into a passing test.
+/// Failure modes: revert, return false before moving funds, exhaust the stipend, and
+/// move the funds then return false (the last one was reported as a defect against
+/// a578235 and fixed with `paySelf`; it must be owed once, never paid and owed).
 contract Imdex5ClaimsHandler is Test {
     Imdex5 public index;
     MockPoolManager public pm;
@@ -24,6 +24,9 @@ contract Imdex5ClaimsHandler is Test {
     uint256 public successfulMints;
     uint256 public failedMints;
     uint256 public redemptions;
+    uint256 public imdRedemptions;
+    uint256 public failedImdRedemptions;
+    uint256 public inKindDebts;
     uint256 public successfulClaims;
     uint256 public failedClaims;
 
@@ -158,6 +161,68 @@ contract Imdex5ClaimsHandler is Test {
         }
     }
 
+    /// redeemToImd: sales inside the unlock, the unsold part paid in kind after it through
+    /// the same `_pay`. Every coin's backing drop must split into what the pool took and
+    /// the in-kind share; the in-kind share into what arrived and a new debt.
+    function redeemToImd(uint256 whoSeed, uint256 amountSeed, uint8 edge, uint256 minSeed) external {
+        address who = actors[whoSeed % 3];
+        uint256 available = shareLedger[who];
+        if (available == 0) return;
+        uint256 amount = edge % 3 == 0 ? available : edge % 3 == 1 ? 1 : bound(amountSeed, 1, available);
+        uint256 supply = index.totalSupply();
+        uint256 n = assets.length;
+        uint256[] memory backing = new uint256[](n);
+        uint256[] memory user = new uint256[](n);
+        uint256[] memory pool = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            backing[i] = _backing(i);
+            user[i] = MockERC20(assets[i]).balanceOf(who);
+            pool[i] = MockERC20(assets[i]).balanceOf(address(pm));
+        }
+        uint256 feeBefore = index.feeImd();
+        uint256 imdOwedBefore = index.owed(who, assets[n - 1]);
+        // mostly no floor; sometimes an unreachable one that must roll everything back
+        uint256 minimum = minSeed % 4 == 0 ? type(uint256).max : 0;
+        bytes32 beforeState = _digest();
+        vm.prank(who);
+        (bool ok,) = address(index).call(abi.encodeCall(Imdex5.redeemToImd, (amount, minimum)));
+        if (!ok) {
+            ++failedImdRedemptions;
+            assertEq(_digest(), beforeState, "reverted redeemToImd changed balances, reserves or debts");
+            return;
+        }
+        ++imdRedemptions;
+        shareLedger[who] -= amount;
+        burned += amount;
+        uint256 keep = amount == supply ? 10_000 : 9950;
+        uint256 imdSold;
+        for (uint256 i; i + 1 < n; ++i) {
+            MockERC20 coin = MockERC20(assets[i]);
+            uint256 share = backing[i] * amount / supply;
+            uint256 poolIn = coin.balanceOf(address(pm)) - pool[i];
+            assertLe(poolIn, share, "sold more than the redeemer's share");
+            uint256 drop = backing[i] - _backing(i);
+            uint256 inKind = drop - poolIn;
+            uint256 unsold = share - poolIn;
+            assertLe(inKind * 10_000, unsold * keep, "in-kind part overpaid");
+            assertGt((inKind + 1) * 10_000, unsold * keep, "in-kind part underpaid");
+            uint256 received = coin.balanceOf(who) - user[i];
+            assertLe(received, inKind, "in-kind payment exceeds the share");
+            if (inKind > received) ++inKindDebts;
+            debtLedger[who][assets[i]] += inKind - received;
+        }
+        MockERC20 imdToken = MockERC20(assets[n - 1]);
+        imdSold = pool[n - 1] - imdToken.balanceOf(address(pm));
+        uint256 proceeds = imdSold + backing[n - 1] - _backing(n - 1);
+        assertEq(backing[n - 1] - _backing(n - 1), backing[n - 1] * amount / supply, "idle IMD share");
+        uint256 out = imdToken.balanceOf(who) - user[n - 1];
+        uint256 fee = index.feeImd() - feeBefore;
+        assertEq(out + fee, proceeds, "IMD proceeds not conserved");
+        if (amount == supply) assertEq(fee, 0, "last holder charged a fee");
+        else assertTrue(fee * 10_000 >= proceeds * 50 && (fee == 0 || (fee - 1) * 10_000 < proceeds * 50), "fee");
+        assertEq(index.owed(who, assets[n - 1]), imdOwedBefore, "redeemToImd owes IMD");
+    }
+
     function claim(uint256 whoSeed, uint256 assetSeed) external {
         _claim(actors[whoSeed % 3], assets[assetSeed % assets.length]);
     }
@@ -192,7 +257,7 @@ contract Imdex5ClaimsHandler is Test {
 
     function changeFailure(uint256 assetSeed, uint8 mode, bool dead, uint256 maxIn) external {
         uint256 i = assetSeed % assets.length;
-        MockERC20(assets[i]).setFailMode(mode % 4);
+        MockERC20(assets[i]).setFailMode(mode % 5);
         if (i < hooks.length) {
             pm.setDead(_key(i), dead);
             pm.setMaxIn(_key(i), bound(maxIn, 0, 5e18));
@@ -240,13 +305,14 @@ contract Imdex5ClaimsInvariantTest is Imdex5Base {
         vm.stopPrank();
         handler = new Imdex5ClaimsHandler(index, participants);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = handler.mint.selector;
         selectors[1] = handler.redeem.selector;
         selectors[2] = handler.claim.selector;
         selectors[3] = handler.transferShares.selector;
         selectors[4] = handler.changeFailure.selector;
         selectors[5] = handler.exitAll.selector;
+        selectors[6] = handler.redeemToImd.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 
@@ -307,6 +373,28 @@ contract Imdex5ClaimsInvariantTest is Imdex5Base {
         handler.claim(0, 0);
         handler.claim(0, 5);
         assertEq(handler.successfulClaims(), 2);
+        invariant_everyHolderAndCreditorIsBacked();
+        afterInvariant();
+    }
+
+    /// Deterministic witness for the redeemToImd path: an unsellable coin that moves funds
+    /// and returns false is owed once, an unmet floor rolls back, and debts are claimable.
+    function test_handlerRedeemToImdOwesInKindOnce() public {
+        handler.changeFailure(1, 4, true, 0); // coin 1: dead pool, transfer moves then returns false
+        uint256 coinBefore = MockERC20(tokens[1]).balanceOf(bob);
+        handler.redeemToImd(1, 0, 2, 0); // floor = max: must roll back
+        assertEq(handler.failedImdRedemptions(), 1);
+        handler.redeemToImd(1, 100e18, 2, 1);
+        assertEq(handler.imdRedemptions(), 1);
+        assertGt(handler.inKindDebts(), 0);
+        assertGt(index.owed(bob, tokens[1]), 0);
+        assertEq(MockERC20(tokens[1]).balanceOf(bob), coinBefore, "false-returning transfer kept");
+        invariant_everyHolderAndCreditorIsBacked();
+        handler.changeFailure(1, 0, false, 0);
+        uint256 debt = handler.debtLedger(bob, tokens[1]);
+        handler.claim(1, 1);
+        assertEq(MockERC20(tokens[1]).balanceOf(bob) - coinBefore, debt, "claimed once, in full");
+        assertEq(index.owed(bob, tokens[1]), 0);
         invariant_everyHolderAndCreditorIsBacked();
         afterInvariant();
     }
