@@ -7,7 +7,91 @@ dependencies remain unchanged: solc 0.8.26, optimizer 200 runs, via IR, Cancun, 
 No deployment, signing or broadcasting is performed by this work. The existing manifest is
 untouched; launch handoff belongs to the subsequent manifest/deployment step.
 
-## This launch: the code of 1668 with the 886e7c22 fixes, audited again
+## This launch: commit a578235 (launch 2343's code with the 705dd677 fixes), audited again
+
+The repository arrived at commit `a578235` and is deployed as it is: one contract, `Imdex5`, no
+constructor arguments, no owner, no launch token, Ethereum mainnet (chain id 1). The brief: fix
+every finding of medium or above from the new audit with the smallest change, document the low
+and informational ones, keep everything else. The audit reported one low and three informational
+findings and nothing of medium or above, so `src/` is unchanged (runtime 23,552 bytes, as before).
+
+### Changes
+
+1. **`test/Imdex5DocumentedLimits.t.sol` (new).** Each finding reproduced and pinned as a
+   documented limit, so a later change of behaviour shows up: a pool pumped 44% before a
+   rebalance is bought at the pumped price and booked (65-75% of the fair fill, the same IMD
+   spent, `held` equal to the balance); a leaver dumped 31% first is sold at the dumped price and
+   booked (at least 60% of the fair proceeds); a limited sale sells 0.95-1.05% of the pool's coin
+   reserve, the residual stays at index 5 of `coins()`, is redeemed proportionally and is sold
+   whole by the next week's rebalance once it is under 1% of the reserve; a failed and a closed
+   request each leave `lastAsk` in place, so `ask` reverts `AskTooSoon` until seven days after the
+   failed ask and then opens a new request; a failed request keeps the IMD balance equal to
+   `feeImd + idleImd` before, during and after, through a mint, a redeemToImd and the next ask.
+2. **`README.md`, `THREAT_MODEL.md`, this file.** The findings table, the accepted limits and the
+   reproductions below. Test count 171 to 177.
+
+Nothing else: no change to the constructor, the constants, the accounting, the swap rules, the
+oracle flow, the tests that existed, or the protected configuration. `launch.json` is the file
+that arrived with the repository and is left to the manifest step.
+
+### The audit's findings, reproduced
+
+- **Low, `9f216ca3…` (`PoorFill` and the 2% limit measured against a spot price the caller can
+  set first): reproduced, documented, not redesigned.** The audit's numbers hold on the mocks:
+  alice `mintFirst(1000e18)`, the fifth coin replaced by launch 2000, bob `rebalance()` books
+  2,035.6e18 of the new coin; from the same snapshot with the new coin's pool set to 833,333
+  coins / 12,000 IMD (price +44%), `rebalance()` books 1,414.1e18 (30.5% fewer) for the same IMD,
+  with no `SwapSkipped`. The sale side behaves the same: the leaver's pool set to 1,200,000 /
+  8,333 (price -31%) sells at that price. `PoorFill` compares against `p0`, read in `swapSelf`
+  right before the swap, so a moved pool passes it at about 98%. The loss is bounded: a limited
+  swap trades at most what moves the sqrt price 1% (about 1% of the pool's reserve per coin per
+  weekly rebalance), the mover pays the pool fee twice on mainnet (1.25% each way), and the
+  index's IMD never leaves the accounting (`held` equals the balance, the IMD balance equals
+  `feeImd + idleImd`). A caller-independent reference price (a TWAP, an oracle) is a redesign
+  of the rebalance; the brief says low findings are documented, not redesigned.
+- **Info, `0a7c3762…` (a limited sell clears only part of a leaver per rebalance): reproduced
+  with a correction to the rate.** After the first mint `held[leaver]` is 19,511.7e18 and one
+  rebalance leaves 9,607.8e18 (49%), as the audit says. The rule is not "half": the sale stops at
+  a 1% sqrt-price move, which on a constant-product pool is 1/0.99 - 1 = 1.01% of the pool's coin
+  reserve (9,904e18 of 980,488e18 here). A residual under that is sold whole by the next
+  rebalance, which the test shows: after a 10% redeem the 8,652e18 left clears a week later and
+  the coin leaves `coins()`. A leaver worth more than about 1% of its pool's reserve takes as
+  many weekly rebalances as that ratio says. Gas: one coin per unsold leaver in every loop, with
+  `SWAP_GAS` and `PAY_GAS` per coin, as the README's security notes already said.
+- **Info, `18ca8bf9…` (`ask` commits the interval before the outcome): reproduced.** Fund 2e18,
+  `ask()` at T (`lastAsk` = T, `feeImd` 1.25e18), `onOracleFailure` at T + 1 hour closes the
+  request (`openSince` 0, `lastAsk` still T), `ask()` at T + 1 hour + 1 second reverts
+  `AskTooSoon`, `ask()` at T + 7 days opens request 2 and `feeImd` is 0.5e18. The same for a
+  request `closeRequest` closes at T + 2 days. This is the brief's "weekly at most"; a retry on
+  failure would be a new rule. Documented.
+- **Info, `e2325942…` (IMD the Intake might return on a failed request would be stranded): does
+  not reproduce; the premise is false for the live Intake.** The auditor had no fork and could not
+  read the Intake. Its source is published on Sourcify for chain 1 at
+  `0xa43e6F75ee006411F79Ac1C84120606C2330DE82` with a full creation and runtime match
+  (verified 2026-10-10): the contract "holds nothing: every payment is forwarded to `payTo` in the
+  same call" (`_collect` does `safeTransferFrom(msg.sender, payTo, amount)`), and `complete` on a
+  non-zero status only calls the payer's failure selector with the arguments the writer supplies;
+  there is no transfer on that path. So no IMD comes back, nothing can be stranded, and the mock
+  Intake (which keeps the 0.5 IMD) matches. `test_aFailedRequestLeavesEveryImdAccounted` pins
+  invariant 1 across a failed request. The audit's suggested change (`feeImd += ORACLE_PRICE`
+  when the balance shows a refund) is not made: it would credit any IMD sent to the contract by
+  mistake to the fee pot on the next failure, a behaviour nobody asked for.
+
+### Validation
+
+```sh
+forge build --sizes
+FOUNDRY_FUZZ_SEED=0x906f674ec82bd2e74061fa6aef3b6c6756390329a66f79e32b26b24c14dfbc97 forge test
+```
+
+Imdex5 runtime 23,552 bytes (1,024 under EIP-170), initcode 26,127 bytes, nonpayable constructor
+with no arguments that calls no contract; no DELEGATECALL, CALLCODE or SELFDESTRUCT. 177 tests
+pass with the verifier's seed; the 7 mainnet fork tests skip without a fork URL (not run here).
+Every suite uses local mocks and reads no environment. The protected floor's needs are
+unchanged: one contract, zero ETH, no arguments, no owner or admin, nothing assigned to the
+factory or to IMD.
+
+## The previous revision: the code of 1668 with the 886e7c22 fixes, audited again
 
 The repository arrived at commit `6ee29fbc` (launch 1668's code, the minimum-shares floor on
 `mint`, and the fixes audit 886e7c22 asked for). The brief: deploy it as it is, fix every finding

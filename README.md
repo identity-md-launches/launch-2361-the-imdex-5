@@ -17,6 +17,7 @@ Contracts only: no launch token, pool or website.
 | `src/Interfaces.sol` | The slices of the Uniswap v4 `PoolManager`, the launch registries and the Intake that the index calls. |
 | `test/Imdex5.t.sol` | Behaviour, failure and attack tests against mocks. |
 | `test/Imdex5ResidualSpot.t.sol` | The residual attacks: a dumped residual whose buy reverts cannot be minted at spot; a residual hook that burns gas or leaves a delta fails the mint; a dumped pool that trades is bought in full; a short fill is charged at least its fair value. |
+| `test/Imdex5DocumentedLimits.t.sol` | The documented limits of this launch's audit: a pool moved before a rebalance is traded at the moved price within a bound; a limited sale sells about 1% of the reserve; a failed or closed request costs the week; a failed request leaves every IMD accounted. |
 | `test/OracleConsumerConformance.t.sol` | The protocol's digest and selector vectors. |
 | `test/mocks/Mocks.sol` | Mock ERC-20 (can revert, return false or burn gas), a constant-product stand-in for the PoolManager (price limits, partial fills, short fills, the nonzero-delta count), registries, Intake, an ERC-1271 signer and a hook that re-enters, burns gas or leaves a delta unsettled. |
 | `lib/` | OpenZeppelin Contracts 5.6.1 and forge-std 1.9.6, vendored as ordinary files. |
@@ -258,7 +259,17 @@ Documented limits of the residual rule (audit be08f42a and 4acb1b2e, both low, n
   buyer who will not accept a short fill sets `minShares`, which reverts the whole mint.
 - `ask` debits `feeImd` by the oracle price before the Intake pulls it; the accounting
   invariant assumes the Intake pulls exactly `ORACLE_PRICE` in that call, as the version 2
-  Intake does (audit f094a9a7, informational).
+  Intake does (audit f094a9a7, informational). The Intake forwards that payment to its `payTo`
+  in the same call and holds nothing, so nothing comes back on a failed request either (audit
+  e2325942, informational; source verified on Sourcify).
+- `rebalance` measures its 2% limit and the `PoorFill` floor against the pool's price when it
+  runs, so a caller who moves a pool first has the index trade at the moved price, bounded to
+  about 1% of that pool's reserve per coin per week (audit 9f216ca3, low; documented, not
+  redesigned; see "Findings in this launch").
+- A limited sale sells about 1% of a pool's coin reserve per rebalance, so a larger leaver stays
+  as a residual and is sold again each week (audit 0a7c3762, informational). A request that
+  fails or is closed costs its week: `lastAsk` is set when the request opens (audit 18ca8bf9,
+  informational).
 
 Gas to supply: `rebalance` needs at most `SWAP_GAS` per swap it attempts (up to 5 sales of
 leavers, one trim per holding and one buy per list coin) plus a few hundred thousand; `redeem`
@@ -281,7 +292,26 @@ Nothing is owned. After launch:
 - The launch deploys `Imdex5` from its bytecode as built, with no arguments. No `launch.json` is
   written here; the manifest step writes it.
 
-## Changes for this launch (from launch 2343's code)
+## Findings in this launch (audit of commit a578235)
+
+The audit of this launch's code reported one low and three informational findings and nothing of
+medium or above, so no code changed: the brief fixes medium and above and documents the rest.
+Each was reproduced and is pinned in `test/Imdex5DocumentedLimits.t.sol`; the reproductions are
+in `ADAPTATION.md` and the limits in `THREAT_MODEL.md`.
+
+| Finding | Severity | Outcome |
+| --- | --- | --- |
+| `9f216ca3…` `PoorFill` and the 2% limit are measured against the spot price the `rebalance` caller can set first, so a pre-moved pool is bought or sold at the moved price and booked. | low | Reproduced (a 44% pump of the entering coin's pool costs that one buy about 30% of its coins; a 31% dump of the leaver's pool costs its sale about the same). Documented as an accepted bound: a rebalance swap trades at most about 1% of a pool's reserve per coin per week, and on mainnet the 1.25% pool fee each way makes the sandwich net-negative for the mover. A reference price the caller cannot set is a redesign; not made. |
+| `0a7c3762…` A limited sell clears only part of a leaving holding per rebalance, so residuals persist and every mint, redeem and rebalance loops over them. | info | Reproduced. A limited sale sells about 1% of the pool's coin reserve per rebalance (a 1% sqrt-price move), so a leaver larger than that stays as a residual and is sold again each week until gone. Residuals are the normal state after a list change; the gas growth is one coin per unsold leaver. |
+| `18ca8bf9…` `ask()` commits the 7-day interval before the request's outcome, so a failed, closed or under-quorum request costs the whole week. | info | Reproduced: after `onOracleFailure` or `closeRequest`, `ask` reverts `AskTooSoon` until seven days after the failed ask, and the 0.75 IMD is spent. This is the "weekly at most" rule; documented. |
+| `e2325942…` IMD the Intake might return on a failed request would be unaccounted and stranded (the auditor could not read the live Intake). | info | Does not reproduce. The version 2 Intake's source is verified on Sourcify (chain 1, `0xa43e…DE82`, full creation and runtime match): it forwards every payment to its `payTo` inside the request call, holds nothing, and `complete` on a failure only calls the failure selector. No IMD comes back, the mock matches, and invariant 1 holds across a failed request (tested). |
+
+| File | Change and reason |
+| --- | --- |
+| `test/Imdex5DocumentedLimits.t.sol` | New: the four findings above as pinned limits (a pool moved before a rebalance is traded at the moved price and booked, within the stated bound, for a buy and for a sale; a limited sale sells about 1% of the reserve and the residual clears over weekly rebalances; a failed and a closed request each cost the week; a failed request leaves every IMD accounted). |
+| `README.md`, `THREAT_MODEL.md`, `ADAPTATION.md` | This section, the accepted limits and the reproductions. No change to `src/`: runtime stays 23,552 bytes. 177 unit and fuzz tests and 8 mainnet fork tests. |
+
+## Changes for the previous revision (from launch 2343's code)
 
 In-house audit of launch 2343's deployed code against audit 705dd677 (run on an earlier commit):
 its medium and two lows were still open and are fixed here.
@@ -292,7 +322,7 @@ its medium and two lows were still open and are fixed here.
 | `src/Imdex5.sol` | `_swap`: the swap amount is converted with `SafeCast.toInt256` (audit 705dd677, low). `_mintMore`: `minShares > shares` reverts `TooFewShares` before any buy (audit 705dd677, low). |
 | `test/Imdex5RebalanceNothingOut.t.sol` | New: rebalance buy and sell that pay nothing are skipped (both fail on launch 2343's code); a buy that pays 1 wei is skipped, one that pays 60% trades. |
 | `test/Imdex5Revised.t.sol`, `test/Imdex5TaxEverywhere.t.sol` | Tests that pinned the old booking now assert the skip; a `redeemToImd` sale that would pay nothing pays that coin in kind. |
-| `THREAT_MODEL.md`, `README.md` | Describe the shipped behaviour. Runtime 23,552 bytes; 171 unit and fuzz tests and 8 mainnet fork tests pass. |
+| `THREAT_MODEL.md`, `README.md` | Describe the shipped behaviour. Runtime 23,552 bytes; 171 unit and fuzz tests (177 with the documented-limits suite above) and 8 mainnet fork tests pass. |
 
 Known limit, documented (not redesigned for this launch): a residual whose pool rejects every buy
 forever blocks `mint` until a `rebalance` sells it; `redeem` and `redeemToImd` keep paying.
