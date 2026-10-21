@@ -45,7 +45,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     /// @dev A limited swap stops where the sqrt price has moved 1% (the price about 2%).
     uint256 public constant SQRT_UP_BPS = 10_100;
     uint256 public constant SQRT_DOWN_BPS = 9_900;
-    /// @dev Gas given to one skippable swap (`swapSelf`) and to one coin payment (`_pay`), so a
+    /// @dev Gas given to one skippable swap (`swapSelf`) and to one coin payment (`paySelf`), so a
     /// hook or coin that burns everything it is given cannot starve the rest of the call.
     uint256 public constant SWAP_GAS = 1_000_000;
     uint256 public constant PAY_GAS = 300_000;
@@ -227,13 +227,18 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
 
     /// @notice Burns `shares`, sells the proportional holdings, adds the proportional idle IMD,
     /// keeps 0.50% as fee and pays the rest in IMD. A coin whose sale fails is paid in kind under
-    /// the redeem rule (99.50%, all of it when the supply reaches zero).
+    /// the redeem rule (99.50%, all of it when the supply reaches zero), after the PoolManager is
+    /// locked again, so the coin's transfer cannot touch the manager and revert the whole call.
     function redeemToImd(uint256 shares, uint256 minImdOut) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
         uint256 supply = totalSupply();
         _burn(msg.sender, shares);
-        IPoolManager(POOL_MANAGER)
+        bytes memory result = IPoolManager(POOL_MANAGER)
             .unlock(abi.encode(Op.RedeemToImd, msg.sender, shares, minImdOut, supply, new uint256[](0)));
+        uint256[] memory inKind = abi.decode(result, (uint256[]));
+        for (uint256 i = 0; i < inKind.length; ++i) {
+            _pay(_coins[i].token, msg.sender, inKind[i]);
+        }
     }
 
     /// @notice Takes a coin a redeem could not transfer.
@@ -353,7 +358,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
             abi.decode(data, (Op, address, uint256, uint256, uint256, uint256[]));
         if (op == Op.MintFirst) _mintFirst(caller, a, arr);
         else if (op == Op.Mint) _mintMore(caller, a, b, c);
-        else if (op == Op.RedeemToImd) _redeemToImd(caller, a, b, c);
+        else if (op == Op.RedeemToImd) return _redeemToImd(caller, a, b, c);
         else _rebalance();
         return "";
     }
@@ -460,23 +465,36 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
         emit Minted(caller, minted, total);
     }
 
-    function _redeemToImd(address caller, uint256 shares, uint256 minImdOut, uint256 supply) private {
+    /// @dev Returns the in-kind amounts (one per coin, under the redeem rule) that `redeemToImd`
+    /// pays once the manager is locked again: no coin is called while the manager is unlocked.
+    function _redeemToImd(address caller, uint256 shares, uint256 minImdOut, uint256 supply)
+        private
+        returns (bytes memory)
+    {
         uint256 proceeds = 0;
         uint256 keepBps = supply == shares ? BPS : BPS - FEE_BPS;
         uint256 n = _coins.length;
+        uint256[] memory inKind = new uint256[](n);
         for (uint256 i = 0; i < n; ++i) {
             Coin memory coin = _coins[i];
             uint256 amount = Math.mulDiv(held[coin.token], shares, supply);
             if (amount == 0) continue;
             held[coin.token] -= amount;
+            uint256 unsold = amount;
             try this.swapSelf{gas: SWAP_GAS}(coin.token, coin.hook, false, amount, false, false) returns (
                 uint256 amountIn, uint256 sold
             ) {
                 proceeds += sold;
-                if (amountIn < amount) _payInKind(coin.token, caller, amount - amountIn, keepBps);
+                unsold = amount - amountIn;
             } catch {
                 emit SwapSkipped(coin.token, false, amount);
-                _payInKind(coin.token, caller, amount, keepBps);
+            }
+            if (unsold > 0) {
+                // the unsold part is paid in kind under the redeem rule: `keepBps` of it to the
+                // redeemer, the rest stays with the remaining holders
+                uint256 paid = unsold * keepBps / BPS;
+                held[coin.token] += unsold - paid;
+                inKind[i] = paid;
             }
         }
         uint256 idlePart = Math.mulDiv(idleImd, shares, supply);
@@ -489,6 +507,7 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
         if (out < minImdOut) revert TooLittleOut(out);
         IERC20(IMD).safeTransfer(caller, out);
         emit RedeemedToImd(caller, shares, out);
+        return abi.encode(inKind);
     }
 
     function _rebalance() private {
@@ -575,7 +594,13 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
             if (zeroForOne ? moved > MIN_SQRT_PRICE : moved < MAX_SQRT_PRICE) limit = uint160(moved);
         }
         int256 delta = IPoolManager(POOL_MANAGER)
-            .swap(key, IPoolManager.SwapParams(zeroForOne, exactOut ? SafeCast.toInt256(amount) : -SafeCast.toInt256(amount), limit), "");
+            .swap(
+                key,
+                IPoolManager.SwapParams(
+                    zeroForOne, exactOut ? SafeCast.toInt256(amount) : -SafeCast.toInt256(amount), limit
+                ),
+                ""
+            );
         int256 d0 = delta >> 128;
         int256 d1 = int256(int128(delta));
         (int256 dIn, int256 dOut) = zeroForOne ? (d0, d1) : (d1, d0);
@@ -634,25 +659,23 @@ contract Imdex5 is ERC20, ReentrancyGuard, OracleAttestationConsumer, IUnlockCal
     }
 
     // ---- internals: payments ----
-    /// @dev Pays a redeemer's proportional `amount` of `token` in kind under the redeem rule:
-    /// `keepBps` of it is paid and the rest stays with the remaining holders.
-    function _payInKind(address token, address to, uint256 amount, uint256 keepBps) private {
-        uint256 paid = amount * keepBps / BPS;
-        held[token] += amount - paid;
-        _pay(token, to, paid);
+    /// @notice One coin transfer that reverts unless the coin moved the funds and reported
+    /// success (a false return, no return data from an address without code, or a revert), so
+    /// `_pay` can skip it and record the amount as owed with the coin's own state change rolled
+    /// back: a coin that moves the funds and then returns false is not paid twice. Only this
+    /// contract calls it.
+    function paySelf(address token, address to, uint256 amount) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        IERC20(token).safeTransfer(to, amount);
     }
 
     /// @dev Pays `amount` of `token` with `PAY_GAS`; a transfer that fails, returns false or
     /// targets no code is recorded as owed instead of reverting.
     function _pay(address token, address to, uint256 amount) private {
         if (amount == 0) return;
-        // slither-disable-next-line low-level-calls
-        (bool ok, bytes memory ret) = token.call{gas: PAY_GAS}(abi.encodeCall(IERC20.transfer, (to, amount)));
-        bool success =
-            ok && (ret.length == 0 ? token.code.length > 0 : (ret.length >= 32 && uint256(bytes32(ret)) == 1));
-        if (success) {
+        try this.paySelf{gas: PAY_GAS}(token, to, amount) {
             emit Paid(to, token, amount);
-        } else {
+        } catch {
             owed[to][token] += amount;
             emit Owed(to, token, amount);
         }

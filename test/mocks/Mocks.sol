@@ -6,9 +6,10 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IIntake, IPoolManager, IRegistry, IUnlockCallback} from "../../src/Interfaces.sol";
 
-/// @dev A plain ERC-20 whose transfers can be made to revert, return false or burn all gas.
+/// @dev A plain ERC-20 whose transfers can be made to revert, return false, burn all gas, or
+/// move the funds and then return false.
 contract MockERC20 {
-    uint8 public failMode; // 0 ok, 1 revert, 2 return false, 3 burn every gas given
+    uint8 public failMode; // 0 ok, 1 revert, 2 return false, 3 burn every gas given, 4 move then return false
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
@@ -33,7 +34,8 @@ contract MockERC20 {
         if (failMode == 3) _burnGas();
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
-        return true;
+        // mode 4: the funds moved, but the coin reports failure (review eade2f07)
+        return failMode != 4;
     }
 
     function transferFrom(address from, address to, uint256 amount) external returns (bool) {

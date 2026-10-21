@@ -30,6 +30,80 @@ contract Imdex5DocumentedLimitsTest is Imdex5Base {
         return false;
     }
 
+    /// @dev Review 2ff07688 (low): step (4) of a rebalance caps each list coin at a quarter of total
+    /// value even when the list has fewer than four coins, so with `k < 4` coins at most `k / 4` of
+    /// the index is invested and the rest stays idle IMD that no later rebalance to the same list
+    /// spends. Pinned: a two-coin list leaves about half the value idle, and a second rebalance a
+    /// week later changes nothing. No value is lost (redeem and redeemToImd return idle IMD at
+    /// par) and a list of four or more coins invests fully; documented, not redesigned.
+    function test_aListOfFewerThanFourCoinsLeavesTheRestIdle() public {
+        _mintFirst(alice, 100e18);
+        uint64[] memory two = _launches(2);
+        _deliverList(two);
+        vm.prank(bob);
+        index.rebalance();
+        assertEq(index.coins().length, 2, "the leavers were sold whole");
+        uint256 idle = index.idleImd();
+        uint256 total = idle;
+        for (uint256 i = 0; i < 2; ++i) {
+            total += index.held(tokens[i]) * _priceOf(tokens[i], hooks[i]) / 1e18;
+        }
+        // about half the value is idle: two quarters invested, the rest cash
+        assertGe(idle, total * 48 / 100, "less than about half idle");
+        assertLe(idle, total * 52 / 100, "more than about half idle");
+
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        _deliverList(two);
+        vm.prank(bob);
+        index.rebalance();
+        assertEq(index.idleImd(), idle, "a later rebalance to the same short list spent idle IMD");
+        assertEq(index.coins().length, 2);
+    }
+
+    /// @dev Review 87c33a5f (low, documentation): a list coin whose pool is dead blocks `mint` and
+    /// no rebalance drops it while `held > 0`: step (1) cannot sell it through the dead pool, step
+    /// (2) keeps it as a residual, and the residual's buy reverts `BuyFailed` on every later mint
+    /// until the pool works again or every holder redeems. Pinned so the threat model's wording
+    /// ("until the pool works again or a rebalance sells it") matches what happens; `redeem` works.
+    function test_aDeadListCoinIsNotDroppedByARebalanceAndBlocksMintUntilItsPoolWorks() public {
+        _mintFirst(alice, 1000e18);
+        pm.setDead(_key(tokens[0], hooks[0]), true);
+        vm.prank(bob);
+        vm.expectRevert();
+        index.mint(10e18, 100e18, 0);
+
+        uint64[] memory list = new uint64[](5);
+        for (uint256 i = 0; i < 4; ++i) {
+            list[i] = launches[i + 1];
+        }
+        list[4] = 2000;
+        _deliverList(list);
+        vm.prank(bob);
+        index.rebalance();
+        assertEq(index.listCount(), 5);
+        assertEq(index.coins().length, 6, "the dead coin stays as a residual");
+        assertGt(index.held(tokens[0]), 0);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Imdex5.BuyFailed.selector, tokens[0]));
+        index.mint(10e18, 100e18, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        _deliverList(list);
+        vm.prank(bob);
+        index.rebalance();
+        assertEq(index.coins().length, 6, "a second rebalance does not drop it either");
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Imdex5.BuyFailed.selector, tokens[0]));
+        index.mint(10e18, 100e18, 0);
+        vm.prank(alice);
+        index.redeem(1e18);
+
+        // the pool working again reopens mint; the next rebalance sells the residual
+        pm.setDead(_key(tokens[0], hooks[0]), false);
+        vm.prank(bob);
+        index.mint(10e18, 100e18, 0);
+    }
+
     /// @dev Audit 9f216ca3 (low): `PoorFill` and the 2% limit are measured against the pool's
     /// price when `rebalance()` runs, so a pool the caller moved first is bought at the moved price
     /// and booked. Pinned: the buy is booked, not skipped; the index gets fewer coins for the same

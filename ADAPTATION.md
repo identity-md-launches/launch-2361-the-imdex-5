@@ -7,7 +7,115 @@ dependencies remain unchanged: solc 0.8.26, optimizer 200 runs, via IR, Cancun, 
 No deployment, signing or broadcasting is performed by this work. The existing manifest is
 untouched; launch handoff belongs to the subsequent manifest/deployment step.
 
-## This launch: commit a578235 (launch 2343's code with the 705dd677 fixes), audited again
+## This revision: the independent review of commit a578235
+
+The accepted work below was reopened by an independent review: two medium findings with proofs,
+three lows and one informational. Each was reproduced before anything changed. The two mediums
+are fixed with the smallest change that removes them, each with tests that fail on the previous
+source; the lows and the informational one are documented and pinned, not redesigned, as the
+brief asks. Nothing else changed: constructor, constants, swap rules, mint, oracle flow, fees
+and the protected configuration are as they were. `launch.json` is the file that arrived and is
+left to the manifest step.
+
+### Changes
+
+1. **`src/Imdex5.sol`, `paySelf` and `_pay` (review eade2f07, medium, fixed).** `_pay` made a
+   low-level `transfer` call with `PAY_GAS` and, when the call returned anything but `true`,
+   recorded the amount as owed without undoing the call. A coin whose `transfer` debits the
+   sender and then returns false was therefore paid in full and left claimable; `claim` paid it
+   again out of the other holders' backing (reproduced with the reviewer's proof: `99.0025e18` of
+   coin 0 for a `49.50125e18` entitlement, and the index's coin balance `49.50125e18` under
+   `held`). Now `_pay` calls the new `paySelf(token, to, amount)`, an external function only the
+   contract itself may call, which does `SafeERC20.safeTransfer` and so reverts on a false
+   return, on a revert, on a gas burn and on an address without code (the same predicate the old
+   check had), with `try this.paySelf{gas: PAY_GAS}` and `owed` in the `catch`. The revert rolls
+   the coin's own state change back before anything is owed, so the coin is paid once or owed
+   once, never both. `redeem`, the in-kind part of `redeemToImd` and the idle IMD payment all go
+   through `_pay`; `claim` is unchanged. Reentrancy is unchanged: `paySelf` only accepts the
+   contract itself, every entry point is `nonReentrant`.
+2. **`src/Imdex5.sol`, `redeemToImd`, `unlockCallback`, `_redeemToImd` (review e3e0815c, medium,
+   fixed).** `_redeemToImd` paid a failed or short sale's coin in kind through `_payInKind` and
+   `_pay` while the PoolManager was still unlocked. Uniswap v4's `take` is open to any address
+   while the manager is unlocked and debits the caller's own delta, so a listed coin whose
+   `transfer` (when the index pays it inside an unlock) calls `take(IMD, anyone, 1)` leaves a
+   delta the index cannot settle; `unlock` then reverts `CurrencyNotSettled` and `redeemToImd`
+   fails for every holder for as long as the coin is held (reproduced with the reviewer's proof;
+   the coin only needs to be buyable and to refuse transfers to the manager, so no sale ever
+   clears it). Now `_redeemToImd` books each coin's unsold part under the redeem rule (`keepBps`
+   of it to the redeemer, the rest back into `held`, exactly what `_payInKind` did) into a
+   `uint256[]` with one entry per coin, and returns it `abi.encode`d; `unlockCallback` returns
+   that result for `Op.RedeemToImd`; `redeemToImd` decodes what `unlock` returned and pays each
+   entry with `_pay` after the manager is locked again. `_payInKind` is removed. The amounts,
+   the fee, the IMD payout, the events and the owed fallback are the same; only the moment of the
+   coin transfers moved from inside the unlock to after it, so no coin is called while the
+   manager is unlocked. The reviewer's other option, recording the amounts as owed for a later
+   `claim`, would have changed what a redeemer receives in the same transaction and the tests
+   that assert it; this keeps the behaviour.
+3. **`test/mocks/Mocks.sol`.** `MockERC20` fail mode 4: move the funds, then return false.
+4. **`test/Imdex5Payments.t.sol` (new).** Both fixes. On the previous source (checked with a
+   scratch copy, `paySelf` test removed) four of its tests fail with the reviewer's symptoms:
+   `paid despite the false return` for `redeem` and for `redeemToImd`'s in-kind part, the fuzzed
+   failure-mode test at mode 4, and `CurrencyNotSettled` for the manager-touching coin. On the
+   fixed source all pass: a coin that moves funds and returns false is owed once, `held` plus
+   owed equals the balance, `claim` pays the entitlement once and the backing is intact; every
+   failure mode (revert, false, gas burn, move-then-false) is owed once and nothing moves, the
+   other coins are paid; `paySelf` reverts `OnlySelf` for anyone else; a held coin that refuses
+   sales and takes from the unlocked manager is paid in kind at 99.50% after the unlock (the coin
+   records that the manager was locked when paid), the redeemer gets IMD for the rest, nothing
+   was taken from the manager, every other holder can exit to IMD and the last one gets all of
+   the coin; `redeem` works with that coin held; a short sale pays the unsold part in kind after
+   the unlock and the sold part in IMD, with one `Paid` event; fuzzed shares and dead-pool sets
+   receive exactly the redeem rule's in-kind amounts with `held` equal to the balance.
+5. **`test/Imdex5DocumentedLimits.t.sol`.** Two pinned limits: a two-coin list leaves about half
+   the value idle and a second rebalance a week later spends nothing (review 2ff07688); a dead
+   list coin is kept as a residual by two rebalances, mint reverts `BuyFailed` each time, redeem
+   works, and mint reopens when the pool works again (review 87c33a5f).
+6. **`THREAT_MODEL.md`, `README.md`, this file.** The two fixes, the corrected dead-pool wording
+   (line 29 said "until a rebalance drops it", which no rebalance does), the two new accepted
+   limits (short lists, all-or-nothing `submit`), the redeem and security notes, the measured
+   size. `forge fmt` run on `src/` (review e819c3fc).
+
+### The review's findings, reproduced
+
+- **Medium, `eade2f07…`: reproduced with the proof, fixed (changes 1, 4).** See change 1 for the
+  numbers. The proof passes on the fixed source: the redeemer holds exactly one entitlement and
+  the index's coin-0 balance equals `held`.
+- **Medium, `e3e0815c…`: reproduced with the proof, fixed (changes 2, 4).** On the previous source
+  `redeemToImd` reverted `CurrencyNotSettled` for bob after alice's `mintFirst` and bob's `mint`
+  with the taker coin at index 0; on the fixed source bob is paid IMD for coins 1-4 and his idle
+  share and coin 0 in kind. The proof passes.
+- **Low, `2ff07688…` (fewer than four list coins leave 25%-75% idle): reproduced, documented
+  (changes 5, 6).** Two-coin list after `mintFirst(100e18)`: `coins().length == 2`, idle IMD
+  between 48% and 52% of total value, unchanged by a second rebalance to the same list seven days
+  later. The brief documents lows; capping room by `min(listCount, 4)` is a weighting redesign.
+- **Low, `87c33a5f…` (threat model says a rebalance drops a dead list coin): reproduced, fixed by
+  documentation (changes 5, 6).** Dead pool on coin 0: mint reverts; a list of the other four plus
+  launch 2000 rebalanced twice keeps `coins().length == 6` with coin 0 held; mint reverts
+  `BuyFailed(coin0)` after each; `redeem(1e18)` works; mint works again once the pool is revived.
+- **Low, `e7a4430f…` (one unconsumable answer entry reverts `submit` for the list, every week it
+  ranks): reproduced from `test_submitRejectsALaunchWithoutAHookOrAToken`, documented (change
+  6).** Not redesigned: adopting the consumable entries would apply a list the panel did not
+  sign, and the exclusion clause of the question is the oracle's to apply.
+- **Info, `e819c3fc…` (`forge fmt --check src` fails): reproduced, fixed (`forge fmt`).**
+
+The four findings of the audit of commit a578235 (`9f216ca3`, `0a7c3762`, `18ca8bf9`,
+`e2325942`) were handled in the previous round and are unchanged: documented below and pinned in
+`test/Imdex5DocumentedLimits.t.sol`; none reproduces as a defect that needs code.
+
+### Validation
+
+```sh
+forge build --sizes
+FOUNDRY_FUZZ_SEED=0x906f674ec82bd2e74061fa6aef3b6c6756390329a66f79e32b26b24c14dfbc97 forge test
+forge fmt --check src test
+```
+
+Imdex5 runtime 23,869 bytes (707 under EIP-170), initcode 26,444 bytes, nonpayable constructor
+with no arguments that calls no contract; no DELEGATECALL, CALLCODE or SELFDESTRUCT. 187 tests
+pass with the verifier's seed; the 7 mainnet fork tests skip without a fork URL (not run here).
+The reviewer's two proofs fail on the previous source and pass on this one.
+
+## The previous round: commit a578235 (launch 2343's code with the 705dd677 fixes), audited again
 
 The repository arrived at commit `a578235` and is deployed as it is: one contract, `Imdex5`, no
 constructor arguments, no owner, no launch token, Ethereum mainnet (chain id 1). The brief: fix

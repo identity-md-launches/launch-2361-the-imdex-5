@@ -12,7 +12,7 @@ Contracts only: no launch token, pool or website.
 
 | Path | What |
 | --- | --- |
-| `src/Imdex5.sol` | The index. One contract, no constructor arguments, 23,552 bytes of runtime. |
+| `src/Imdex5.sol` | The index. One contract, no constructor arguments, 23,869 bytes of runtime. |
 | `src/OracleAttestation.sol` | The protocol's `OracleAttestation` library and `OracleAttestationConsumer`, copied whole from the oracle-consumer reference. |
 | `src/Interfaces.sol` | The slices of the Uniswap v4 `PoolManager`, the launch registries and the Intake that the index calls. |
 | `test/Imdex5.t.sol` | Behaviour, failure and attack tests against mocks. |
@@ -74,7 +74,7 @@ the brief's value, so nothing differs and nothing was substituted.
 | `MAX_LIST` | 5 | The most launch numbers an answer may carry. |
 | `MIN_AGREED` | 4 | The panel agreement `onOracleResult` requires. |
 | `SWAP_GAS` | 1,000,000 | Gas given to each skippable swap (`swapSelf` from `rebalance` and `redeemToImd`). A hook that burns everything it is given costs at most this much per swap, so the rest of the call still runs. A swap that needs more is skipped (or, in `redeemToImd`, paid in kind). |
-| `PAY_GAS` | 300,000 | Gas given to each coin transfer in `redeem` and the in-kind part of `redeemToImd`. A coin that burns it all becomes owed instead of starving the next payment. |
+| `PAY_GAS` | 300,000 | Gas given to each coin transfer in `redeem` and the in-kind part of `redeemToImd` (a `safeTransfer` in the reverting self-call `paySelf`). A coin that burns it all, reverts or returns false becomes owed instead of starving the next payment, with its own state change rolled back. |
 
 ## How it works
 
@@ -145,15 +145,22 @@ A site should pass about 97% of the requested shares (SwarmCity's 2% tax already
 
 - `redeem(shares)`: burns, then pays 99.50% of `held * f` of each coin and of `idleImd * f`
   (100% when the supply reaches 0; the 0.50% stays with the remaining holders). No price, no
-  trade. Each transfer gets `PAY_GAS`; one that reverts, returns false, runs out of that gas or
-  targets an address without code is recorded in `owed[caller][coin]` instead of blocking;
-  `claim(coin)` takes it later and can only pay once.
+  trade. Each transfer runs as `safeTransfer` inside the contract's own `paySelf` with `PAY_GAS`;
+  one that reverts, returns false, runs out of that gas or targets an address without code
+  reverts that self-call, which rolls the coin's own state change back, and the amount is
+  recorded in `owed[caller][coin]` instead of blocking. A coin that moves the funds and then
+  returns false is therefore owed, not paid and owed (review eade2f07). `claim(coin)` takes it
+  later and can only pay once.
 - `redeemToImd(shares, minImdOut)`: same burn and `f`; sells `held * f` of each coin inside the
   PoolManager's `unlock`, adds `idleImd * f`, keeps 0.50% as `feeImd`, pays the rest in IMD and
   reverts under `minImdOut`. A coin whose sale reverts (or fills short) is paid in kind under
   the same rule as `redeem`: 99.50% of the unsold part, the rest staying with the remaining
-  holders, and all of it when the supply reaches zero. Both redeem paths therefore pay the same
-  amount of a coin that cannot be sold.
+  holders, and all of it when the supply reaches zero. The in-kind amounts are returned from the
+  unlock callback and paid once the manager is locked again, through the same `_pay` as
+  `redeem`, so no coin is called while the manager is unlocked: a coin whose transfer would
+  touch the manager (v4's `take` is open to any caller while unlocked) can neither leave a delta
+  that reverts the exit nor block any holder's `redeemToImd` (review e3e0815c). Both redeem paths
+  therefore pay the same amount of a coin that cannot be sold.
 
 ### Oracle
 
@@ -219,15 +226,19 @@ next interval as after any failed round.
   `mintFirst` refuses a buy that returns nothing and keeps the IMD the swaps did not consume
   as the holders' idle IMD, so the index can never reach a supply with nothing behind it.
 - Redeem reads no price, makes no swap and cannot be blocked by a coin: failures become `owed`,
-  each transfer is capped at `PAY_GAS` so a coin that burns gas cannot starve the next one, and
-  `claim` zeroes the debt before paying.
+  each transfer is capped at `PAY_GAS` so a coin that burns gas cannot starve the next one, a
+  transfer that reports failure is rolled back with the `paySelf` revert so it cannot be paid and
+  owed, and `claim` zeroes the debt before paying. `redeemToImd` makes no coin transfer inside
+  the PoolManager's unlock; its in-kind payments run afterwards.
 - `feeImd` leaves only to the Intake (0.5 IMD) and as 0.25 IMD rewards.
 - A forged callback (wrong sender, wrong request id, thin agreement) is ignored; a forged
   attestation fails the signature; a tampered field changes the digest.
 
 Accepted, by the brief: thin-pool price impact, a pool's own hook fee, a dead pool blocking mint
-(never redeem), a short fill that issues fewer shares than asked (above), and an oracle that
-never answers. A hook that burns gas or leaves a delta unsettled for the index's swaps makes that
+(never redeem; no rebalance drops a dead coin while it is held, since it can only be sold
+through the same pool, so mint stays closed until the pool works again or every holder
+redeems; review 87c33a5f), a short fill that issues fewer shares than asked (above), and an
+oracle that never answers. A hook that burns gas or leaves a delta unsettled for the index's swaps makes that
 swap a skipped one in `rebalance` and an in-kind payment in `redeemToImd`; in `mint` and
 `mintFirst` it is a failed buy, which reverts, as a dead pool does. That includes a residual: a
 coin that left the list but could not be sold stays in the holdings so it is still redeemed, and
@@ -270,6 +281,15 @@ Documented limits of the residual rule (audit be08f42a and 4acb1b2e, both low, n
   as a residual and is sold again each week (audit 0a7c3762, informational). A request that
   fails or is closed costs its week: `lastAsk` is set when the request opens (audit 18ca8bf9,
   informational).
+- A list of fewer than four coins is invested only a quarter of total value per coin: the trim
+  of step (3) is skipped below four coins, but step (4) still caps each buy at a quarter, so a
+  two-coin list leaves about half the index as idle IMD that no later rebalance to the same
+  list spends. Idle IMD is the holders' and is returned at par by both redeem paths; a list of
+  four or more coins invests fully (review 2ff07688, low; documented, not redesigned).
+- `submit` takes the panel's answer whole: an entry no registry records, or one without a
+  `token` or `hook` artifact, reverts the list and costs that week and its 0.75 IMD; while the
+  panel keeps ranking such a launch the list stays as it is (review e7a4430f, low; documented,
+  not redesigned, since adopting a subset would apply a list the panel did not sign).
 
 Gas to supply: `rebalance` needs at most `SWAP_GAS` per swap it attempts (up to 5 sales of
 leavers, one trim per holding and one buy per list coin) plus a few hundred thousand; `redeem`
@@ -291,6 +311,29 @@ Nothing is owned. After launch:
 - If the oracle never calls back, anyone may `closeRequest()` after 2 days.
 - The launch deploys `Imdex5` from its bytecode as built, with no arguments. No `launch.json` is
   written here; the manifest step writes it.
+
+## Independent review of commit a578235 (this revision)
+
+After the audit below, an independent review of the same code reported two medium findings, both
+reproduced with the reviewer's proofs and fixed with the smallest change; three lows and one
+informational, documented and pinned, not redesigned.
+
+| Finding | Severity | Outcome |
+| --- | --- | --- |
+| `eade2f07…` A coin transfer that moves funds and then returns false is paid and also recorded as owed, so the redeemer is paid twice from other holders' backing. | medium | Reproduced (the proof: redeem of a quarter of the supply paid `99.0025e18` of coin 0, twice the `49.50125e18` entitlement, and left the index's balance below `held`). Fixed: `_pay` runs the transfer as `safeTransfer` inside the new self-call `paySelf` with `PAY_GAS` and records the amount as owed only when that call reverts, so a false return (or a revert, a gas burn, no code) rolls the coin's own state change back before anything is owed. `test/Imdex5Payments.t.sol`. |
+| `e3e0815c…` `redeemToImd` pays a failed sale's coin in kind inside the PoolManager unlock, so a held coin that touches the manager from its transfer makes `redeemToImd` revert for every holder. | medium | Reproduced (the proof: a coin that refuses sales and calls `take` on the unlocked manager from its transfer; `redeemToImd` reverted `CurrencyNotSettled` for every holder). Fixed: `_redeemToImd` books the in-kind amounts (`keepBps` of the unsold part; the rest stays with the holders, as before) and returns them from the unlock callback; `redeemToImd` pays them with `_pay` after `unlock` returns. No coin is called while the manager is unlocked. `test/Imdex5Payments.t.sol`. |
+| `2ff07688…` With fewer than four list coins the quarter cap in step (4) leaves 25%-75% of the index as idle IMD that no later rebalance invests. | low | Reproduced (two coins: about half idle, a second rebalance spends nothing). Documented as a limit (idle IMD is returned at par; a list of four or more invests fully); pinned in `test/Imdex5DocumentedLimits.t.sol`. |
+| `87c33a5f…` THREAT_MODEL.md said a dead list coin blocks mint "until a rebalance drops it"; no rebalance drops a held coin whose pool is dead. | low | Reproduced (two rebalances keep the dead coin as a residual; mint reverts `BuyFailed` each time; redeem works; mint reopens when the pool works). Documentation corrected in `THREAT_MODEL.md` and here; pinned in `test/Imdex5DocumentedLimits.t.sol`. |
+| `e7a4430f…` One answer entry whose launch lacks a token or hook artifact makes `submit` revert for the whole list, costing the week and its 0.75 IMD, repeating while the oracle ranks that launch. | low | Reproduced (`test/Imdex5Revised.t.sol`, `test_submitRejectsALaunchWithoutAHookOrAToken`). Documented as a limit, not redesigned: adopting the consumable subset would apply a list the panel did not sign, and the question's exclusion clause belongs to the oracle. |
+| `e819c3fc…` `forge fmt --check` fails on `src/Imdex5.sol` at the SafeCast swap line. | info | Reproduced; `forge fmt` run on `src/`. |
+
+| File | Change and reason |
+| --- | --- |
+| `src/Imdex5.sol` | `paySelf(token, to, amount)` (external, only the contract itself): `safeTransfer`. `_pay`: `try this.paySelf{gas: PAY_GAS}` and `owed` on revert, replacing the low-level call and return-data check (eade2f07). `redeemToImd`: decodes the in-kind amounts the unlock returned and pays them with `_pay`; `unlockCallback` returns `_redeemToImd`'s result; `_redeemToImd` books each coin's unsold part under the redeem rule into an array it returns instead of calling `_payInKind` (removed) inside the unlock (e3e0815c). Formatted. Runtime 23,869 bytes (+317), 707 bytes under the limit. |
+| `test/mocks/Mocks.sol` | `MockERC20` fail mode 4: move the funds, then return false. |
+| `test/Imdex5Payments.t.sol` | New: the two fixes, each failing on the previous source (a coin that moves funds and returns false is owed once from `redeem` and from `redeemToImd`'s in-kind part, then claimed once; every failure mode is owed once and nothing moves; `paySelf` refuses everyone else; a held coin that touches the manager from its transfer is paid in kind after the unlock, every holder exits to IMD, the last in full; a short sale is paid in kind after the unlock and in IMD for the rest; in-kind payments match the redeem rule for fuzzed shares and dead-pool sets). |
+| `test/Imdex5DocumentedLimits.t.sol` | Two pinned limits: a two-coin list leaves about half idle through a second rebalance; a dead list coin is kept by two rebalances, blocks mint, and mint reopens when its pool works. |
+| `README.md`, `THREAT_MODEL.md`, `ADAPTATION.md` | This section, the redeem and security notes, the accepted limits, the corrected dead-pool wording. 187 unit and fuzz tests and 8 mainnet fork tests. |
 
 ## Findings in this launch (audit of commit a578235)
 
